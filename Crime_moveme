@@ -1,0 +1,874 @@
+###############################################################################
+# Seattle/KC Public Health : Yesler Terrance : Crime Data Analysis
+# by Mike Dolan Fliss. 
+# Summer 2016.
+# Email: michael.fliss@kingcounty.gov - While at SKC Public Health
+#        mike.dolan.fliss@gmail.com - Afterwards.
+###############################################################################
+# This script runs a "push button" analysis of incident crime and 911 response 
+# data, reading data from Seattle Housing Authority (SHA) and Seattle Police
+# Department (SPD).
+#
+# 1. Load packages and global constants
+# 2. Read & prep base spatial data: Seattle, KC, etc.
+# 3. Read & Prep YT & SS Spatial data
+# 4. Read & Prep population data
+# 5. Incident Data: Read, recode, spatialize
+# --MORE HERE--
+############
+# If you are picking up this analysis anew, to update it or move it to a 
+# new machine you'll need to do / know a few things:
+# DO: 
+# - Run install.packages("xxxx") once before these library calls.
+# - Really prefers a 64 bit system with 8G ram at least. Some of the spatial 
+#   questions temporarily spike RAM - 4G ram and Win7+ cause problems.
+# AND KNOW:
+# - I've left a number of detailed analysis notes inside the notes footers 
+#    of code chunks. These include package particularities, intricacies of 
+#    working with spatial data, etc. Peruse them!
+# - I used the newest version of ggplot from Hadley's GitHub, giving me 
+#    pretty subtitles and captions. Code will run with regular cran's ggplot2.
+#    If you want the newest ggplot2, you'll need devtools and the github version.
+# - I'm dumping diagnosis and "where am I" plots out as I go. I generally use
+#    base graphics for speed, and promote to ggplot solutions (or outputting 
+#    shapefiles usable in Qgis or Arcgis) for production level stuff.
+###############################################################################
+# TO DO: 
+# Clarify locations for in and out. Use variable for folders.
+# Hide the known warnings (or avoid, like character and factor stuff)
+# Investigate alternate groupings - since some, like assaults, are mislabeled
+# Round all rates to 2 or 1. No sense in fake precision.
+# Move to block data
+# Change titles of non production graphs to things like "Quick look:"
+###############################################################################
+
+
+###############################################################################
+### 0. Load packages and global constants #####################################
+###############################################################################
+### Packages
+library(rgeos) # For...
+library(sp) # For...
+library(rgdal) #For read and write shapefiles
+#library(devtools) # For installing from alt locations
+#install_github("hadley/ggplot2") #most recent package has subtitles
+library(ggplot2) #for nice graphs and maps
+library(mapproj)
+library(maptools) #for some fortify help - required when ggplotting maps
+library(ggthemes) #for theme_nothing, _tufte. 
+library(tableone) #for CreateTableOne, a great summary function
+library(dplyr) #For friendly data management
+library(tidyr)
+library(tibble) #For dplyr, which likes tbls
+library(stringr) #For pretty string manipulation, like str_wrap()
+#library(raster) #See notes section and raster section on why to hold off on this.
+
+### Constants & Helper Functions
+print_shapefiles = T #Switch and it will print shape file collections to output directory /GIS
+inc_analysis_years = 2008:2015 # NB: Incidents and responses have different spans.
+n_years = length(inc_analysis_years) # Better to set inclusion years. Move down? FIX THIS
+study_years = 2008:2015
+resp_analysis_years = c(2010:2012, 2014:2015) #2013 is super weird!
+ftinmile = 5280; ftinmeter = 3.2808399
+### Helper function: 27,878,400 sq ft = 1 sq mi. Assumes state plane (sq ft) projection
+sqmi_area = function(s, byid=F) {return (gArea(s, byid) / ftinmile^2) } 
+#home.dir = "D:/User/Dropbox/Community/EpiScholars/Yesler Terrace Project/KC YT-RWJ parallel/SPD Data/R Analysis/" #home version
+home.dir = "S:/WORK/Yesler Terrace - RWJ/SPD Data/R Analysis" #May need to update
+setwd(home.dir) 
+map.dir = "../../Map Data/"
+SHA.dir = "../../SHA Admin Data/"
+input.dir = "./input/"
+output.dir = "./output/"
+dir.create("./output/gis", recursive = T) #
+###############################################################################
+# Notes
+# On library(raster) I'm juggling a lot of packages at once here. I know of 
+#  only one namespace conflict/quirk: dplyr and raster. To get around it, 
+#  I do my dplyr work first, then raster work. See detailed links in raster chunk
+#  for more background. 
+# See https://github.com/jrnold/ggthemes on some very clean ggplot themes
+###############################################################################
+
+
+###############################################################################
+### 1A. Read & Prep base spatial data ##########################################
+###############################################################################
+### Convert to WA state plane N in ft since we're doing distance / area math.
+epsg_codes = make_EPSG()
+epsg_codes$note[grepl("Washington",epsg_codes$note)] #could just use code=2926
+wa_proj = epsg_codes["# NAD83(HARN) / Washington North (ftUS)"==epsg_codes$note,]$prj4
+longlat_proj = "+proj=longlat +ellps=WGS84"
+### King county
+kingcounty_spdf = readOGR(dsn=paste0(map.dir,"Washington Counties - 2010 TIGER"), 
+                          layer = "tl_2010_53_county10")
+kingcounty_spdf = kingcounty_spdf[kingcounty_spdf$NAME10 == "King",]
+kingcounty_spdf = spTransform(kingcounty_spdf, CRS(wa_proj))
+plot(kingcounty_spdf, border="black") #If necessary
+
+### Seattle
+seattle_spdf = readOGR(dsn=paste0(map.dir, "Seattle shorelines, city limits and land"), 
+                       layer = "Shorelines", stringsAsFactors = F)
+names(seattle_spdf@data) = tolower(names(seattle_spdf@data)) #stop yelling
+water_spdf = seattle_spdf[seattle_spdf$type %in% c("PUG", "LAK"),] 
+seattle_spdf = seattle_spdf[seattle_spdf$type=="LND",]
+# ^NB there are other elements ("XSM" "SLK" "RES" "OTH" "STR"), but we don't need them.
+seattle_spdf = spTransform(seattle_spdf, CRS(wa_proj))
+water_spdf = spTransform(water_spdf, CRS(wa_proj))
+plot(seattle_spdf, co="#e5f5e0", border="grey") #plot green land
+plot(water_spdf, co="#e5f5f9", border="grey", add=T) #plot blue water
+###############################################################################
+# Notes
+# KC from census tiger: ftp://ftp2.census.gov/geo/pvs/tiger2010st/53_Washington/53/
+# Shorelines from data.seattle.gov: https://data.seattle.gov/dataset/Shorelines/gf6u-sgut
+# See below for notes on state plane projection for KC.
+# http://www.kingcounty.gov/services/gis/gisData/DataStandards.aspx
+# Hilarious. Seattle / KC state plane issues mentioned BY NAME in wikipedia (bottom):
+# https://en.wikipedia.org/wiki/State_Plane_Coordinate_System
+###############################################################################
+
+
+###############################################################################
+#### 1B. Read & Prep YT & SS Spatial data ######################################
+###############################################################################
+# Read Spatial data: Scattered sites 
+scattered_df = read.csv(paste0(SHA.dir,"Scattered sites data/geocoded/Scattered Sites_geocoded.csv"), 
+                        stringsAsFactors = F) #See notes, below on geocoding
+names(scattered_df) = tolower(names(scattered_df))
+scattered_df$gis.status[is.na(scattered_df$gis.latitude) | 
+                          is.na(scattered_df$gis.longitude)] = "Failed: Address not found"
+ss_failed = sum(grepl("Failed", scattered_df$gis.status)) # missing geographies
+if(ss_failed>0){ cat(ss_failed, "(", round(100*ss_failed/nrow(scattered_df),0),
+                     "%) scattered sites missing lat-lon data.")}
+scattered_df$property.name.short = substr(scattered_df$property.name, start = 1, stop = 16)
+scattered_spdf = SpatialPointsDataFrame(data = scattered_df[!grepl("Fail", scattered_df$gis.status),],
+                                        coords = scattered_df[!grepl("Fail", scattered_df$gis.status),
+                                                              c("gis.longitude","gis.latitude")], 
+                                        proj4string = CRS(longlat_proj)) #clean this up
+scattered_spdf = spTransform(scattered_spdf, CRS(wa_proj))
+plot(seattle_spdf); plot(scattered_spdf, pch=".", co="blue", add=T)
+
+### Yesler Terrace
+YT_sp = readOGR(dsn=paste0(map.dir, "KC Blocks & YT Shapes/YT shape collection"), 
+                layer = "YT shape options", stringsAsFactors = F)
+YT_sp = spTransform(YT_sp, CRS(wa_proj))
+
+f = fortify(YT_sp, region = "name"); names(f)[names(f)=="id"] = "name"
+f = merge(f, YT_sp@data); names(f)
+ggplot(f, aes(long,lat,group, color=name, fill=name)) +geom_polygon(alpha=0.2)+
+  labs(title="Options for drawing YT boundaries", 
+       subtitle="The hand drawn map based on SHAs reporting is most accurate. However, \r
+       police beats make calculations much easier (non-spatial), and census blocks make \r
+       population measures easier to integrate. Currently running on hand drawing of space,\r
+       prioritizing accuracy in YT and using buffers (rather than blocks, BGs or beats) in \r
+       scattered sites areas.") + 
+  theme_map()+
+  theme(legend.position = "bottom", legend.title=element_blank())
+
+YT_sp$name #eventually slide back to all of them for testing
+YT_sp = YT_sp[YT_sp$name=="hand drawn",] 
+plot(seattle_spdf); plot(scattered_spdf, pch=".", co="blue", add=T); plot(YT_sp, co="green", add=T)
+###############################################################################
+# Notes
+# On buffers: Note that neither R nor Arcgis really uses "circles" for buffers.
+#  http://resources.arcgis.com/en/help/main/10.1/index.html#//00080000001s000000
+# On geocoding: SS were geocoded using an outside R script, available in 
+#  "other scripts" folder. Could geocode elsewise, like Arc, census, etc.
+###############################################################################
+
+
+###############################################################################
+#### 1C. Read & Prep population data ###########################################
+###############################################################################
+### Read Spatial Data: Blockgroups
+# ...for population surface or over functions
+bgs_spdf = readOGR(dsn=paste0(map.dir, "KC BlockGroups Shapes 2010"), 
+                   layer="tl_2010_53033_bg10", stringsAsFactors = F)
+names(bgs_spdf) = tolower(names(bgs_spdf))
+bgs_spdf = spTransform(bgs_spdf, CRS(wa_proj)) #reproject...
+bgs_spdf = bgs_spdf[seattle_spdf,] #...and subset
+plot(seattle_spdf); plot(bgs_spdf) #add=T?
+bgs_pop = read.csv(paste0(map.dir, "KC BlockGroup Pops/DEC_10_SF1_P1_with_ann.csv"), 
+                   stringsAsFactors = F, skip = 1) #Read exactly in census format
+names(bgs_pop) = tolower(names(bgs_pop))
+bgs_pop$geoid10 = as.character(bgs_pop$id2)
+bgs_spdf = merge(bgs_spdf, bgs_pop) #See note on spatial merges
+names(bgs_spdf)
+
+#Below, there's some nuance here. 
+#May want to ignore water area, functionally, by subsetting bgs by Seattle shorelines.
+bgs_spdf$tablepop = bgs_spdf$aland10+bgs_spdf$awater10
+bgs_spdf$area_sqmi = bgs_spdf$tablepop*ftinmeter^2/ftinmile^2 # See note below on transformations.
+bgs_spdf$area_sqft = bgs_spdf$tablepop*ftinmeter^2 # See note below on transformations.
+bgs_spdf$pop.dens = bgs_spdf$total/bgs_spdf$area_sqmi 
+
+t = spTransform(bgs_spdf, CRS(longlat_proj))
+if(print_shapefiles){writeOGR(t, dsn=paste0(output.dir, "gis"), layer="BG density", driver="ESRI Shapefile", overwrite_layer = T)}
+spplot(t, "pop.dens", col.regions=rev(heat.colors(100)), main="Population density (/sq mi)")
+
+### Read population multiplier. Can improve on this...but may not matter given YT imprecision
+pop.adjust.table = read.csv(paste0(map.dir, "Pop adjustment table/seattle pop adjustment table.csv"))
+
+### Read Spatial Data: Consider census blocks for population surface
+#blocks = readOGR(dsn="../../Map Data/KC Block & YT Shapes/KC Blocks w YT Flag", layer="kc_block_10", stringsAsFactors = F)
+#blocks = spTransform(blocks, CRS(wa_proj)); blocks = blocks[seattle_spdf,]; #plot(blocks)
+#block.pops = read.csv("../../Map Data/KC Blocks Pops 2010/DEC_10_SF1_P1_with_ann.csv", stringsAsFactors = F, skip=1) 
+#names(block.pops) = c("geo.id1", "geoid10", "label", "pop") #assign same var name to make merge easy
+#block.pops$pop=as.numeric(block.pops$pop) #NAs are ok.
+#blocks = merge(blocks, block.pops)
+#blocks$pop.density = blocks$pop/blocks$ALAND10
+#spplot(blocks, "pop.density", col.regions=rev(heat.colors(100)), main="Population density (/sq mi)")
+# NOTE : table(nchar(blocks@data$geoid10)) #note, above: some are 12...
+###############################################################################
+# NOTES : 
+# Consider: adist in base r for matching
+# Consider fuzzy matching for new addresses using adist in base or stringdist package
+# hist(adist("2411 NE 75th St Apt 8, Seattle, WA, 98115", scattered_df$gis.Unit.FullAddress))
+# REMEMBER! Transforming spatial shapes has no impact on the attached data.
+#   That includes populations (ok) as well as area data (not ok!), so you may need
+#   to recalculate area data, for instance from m to ft, after reprojection
+# REMEMBER! Merges in R may naturally reorder the data as its combined - hard to
+#   do otherwise. But if you're merging a spatial object and a data.frame, do 
+#   NOT try to merge the data slot directly with @data. Merge the spatial* object
+#   and the flat file so R knows to keep order and attach to the object. Otherwise 
+#   the data may slide around a lot.
+###############################################################################
+
+
+###############################################################################
+### 2A. Incident Data: Read, recode, spatialize ################################
+###############################################################################
+incidents = read.csv("../SPD Datasets/Data - Incidents/Seattle_Police_Department_Police_Report_Incident.csv") #~10s
+names(incidents) = tolower(names(incidents)) # for consistency
+str(incidents)
+
+# Date fields - convert to date type, get easy year as integer
+incidents$group = incidents$summarized.offense.description #name's too long.
+incidents$group = trimws(incidents$group) #cut white space for consistency
+incidents$occurred.date.or.date.range.start = 
+  as.POSIXct(as.character(incidents$occurred.date.or.date.range.start), format="%m/%d/%Y %H:%M")
+incidents$occurred.date.range.end = 
+  as.POSIXct(as.character(incidents$occurred.date.range.end), format="%m/%d/%Y %H:%M")
+incidents$date.reported = as.POSIXct(as.character(incidents$date.reported), format="%m/%d/%Y %H:%M")
+incidents$original_year = incidents$year #Move existing data. Not sure how it's calc'ed
+incidents$year =  as.numeric(format(incidents$occurred.date.or.date.range.start, format="%Y"))
+table(incidents$year) # 1679 <2008. 473,301 total
+#hist(as.numeric(incidents$year), main="Incident start year dist", xlab="yr", ylab="freq")
+
+incidents = incidents[incidents$year %in% inc_analysis_years,] # Drop what's not to be included
+incidents$year = incidents$year - 2000 #For easy printing
+table(incidents$year); 
+
+### Spatialize & give it a glance
+incidents_spdf = SpatialPointsDataFrame(coords = incidents[,c("longitude", "latitude")], 
+                                        data = incidents,
+                                        proj4string = CRS(longlat_proj)) 
+incidents_spdf$n = 1 #For easy spatial counting 
+incidents_spdf = spTransform(incidents_spdf, CRS(wa_proj)) #Move it back to state plane in ft.
+
+#incidents_spdf = incidents_spdf[seattle_spdf,] # Trivial change I expect. Takes a bit. ~1m
+
+if(print_shapefiles){ writeOGR(incidents_spdf, dsn=paste0(output.dir, "gis"), layer="incidents", #takes ~2m
+                               driver="ESRI Shapefile", overwrite_layer=T, check_exists = T)} 
+plot_sample = incidents_spdf[incidents_spdf$rms.cdw.id %in% sample(incidents_spdf$rms.cdw.id, 5000),]
+plot(seattle_spdf, main="5000 crime incident sample"); plot(YT_sp, add=T, col="green")
+plot(plot_sample, pch=".", size=1, col="dark red", add=T)
+###############################################################################
+# NOTES
+# From: http://www.seattle.gov/seattle-police-department/crime-data/spd-data-sets , 
+# Specfically: https://data.seattle.gov/Public-Safety/Seattle-Police-Department-Police-Report-Incident/7ais-f98f
+# Consider a grouping table - physical, mental, property, etc.
+# Condense to "census shapes: county, city, BGs, Bs" and "YT and SS"
+# See this page on generating cross-tabs fast.
+# http://www.statmethods.net/stats/frequencies.html
+# http://rstudio-pubs-static.s3.amazonaws.com/6975_c4943349b6174f448104a5513fed59a9.html
+# Formerly considered using beats (e.g. G1) to assign YT. Now doing better...
+###############################################################################
+
+
+###############################################################################
+#### 2B. Response data: Read, recode, subset and spatialize ####################
+###############################################################################
+responses =  read.csv("../SPD Datasets/Data - 911 Responses/Seattle_Police_Department_911_Incident_Response.csv", stringsAsFactors = F) #~1m
+names(responses) = tolower(names(responses)); str(responses) # Familiarize 
+
+# Recode: date/time, create year
+responses$group = responses$event.clearance.description #name's too long.
+responses$group = trimws(responses$group) #cut white space for consistency
+responses$datetime = as.POSIXct(responses$event.clearance.date, format="%m/%d/%Y %I:%M:%S %p")
+responses$year = as.numeric(as.character(responses$datetime, format="%Y"))
+table(responses$year); write.table(table(responses$year), "clipboard", sep="\t")
+hist(responses$year) #what the heck is going on in 2013? Deciding to drop.
+sum(table(responses$year)) # ~1.2 Million calls (as of July 2016)
+
+# Drops: (1) incomplete years (update, for instance, when 2016 is complete) and (2) lat/long NA
+drops = (!(responses$year %in% resp_analysis_years))
+cat("Dropping", sum(drops), "responses for years:", 
+    unique(responses$year)[!(unique(responses$year) %in% resp_analysis_years)], "\n")
+responses = responses[!drops, ] 
+drops = (is.na(responses$latitude) | is.na(responses$longitude))
+cat("Dropping", sum(drops), "responses missing lat or long data.\n")
+responses = responses[!drops, ]
+responses$year = responses$year - 2000 #For easy printing
+#hist(responses$year) #wait, should I drop 2010??
+
+### Spatialize & give it a glance
+responses_spdf = SpatialPointsDataFrame(coords = responses[,c("longitude", "latitude")], 
+                                        data = responses,
+                                        proj4string = CRS(longlat_proj)) #check projection!
+responses_spdf$n = 1 #For easy spatial counting 
+responses_spdf = spTransform(responses_spdf, CRS(wa_proj)) #Move it back to state plane in ft.
+if(print_shapefiles){ writeOGR(responses_spdf, dsn=paste0(output.dir, "gis"), layer="911 responses", driver="ESRI Shapefile", 
+                               overwrite_layer=T, check_exists = T)}
+plot_sample = responses_spdf[responses_spdf$cad.cdw.id %in% sample(responses_spdf$cad.cdw.id, 5000),]
+plot(seattle_spdf, main="5000 911 response sample"); plot(YT_sp, add=T, col="green"); 
+plot(plot_sample, pch=".", size=1, col="dark red", add=T)
+
+
+###############################################################################
+# Notes
+# From: http://www.seattle.gov/seattle-police-department/crime-data/spd-data-sets , 
+# Specfically: https://data.seattle.gov/Public-Safety/Seattle-Police-Department-911-Incident-Response/3k2p-39jp
+# Contact SPD for questions about data generation process... still up in the air.
+###############################################################################
+
+
+###############################################################################
+### 3. Create YT/SS spatial stats  ############################################
+# Likely won't need area-based stuff - comment out that code?
+# Still using the buffers
+###############################################################################
+inc_pts = SpatialPoints(incidents_spdf); inc_pts@proj4string = CRS(wa_proj)
+resp_pts = SpatialPoints(responses_spdf); resp_pts@proj4string = CRS(wa_proj)
+
+### Create scattered sites buffers & super "flattened" area
+scattered.buffs.spdf = gBuffer(scattered_spdf, width=c(.5*1609.344), #1/2 mile
+                               byid=T, quadsegs = 10) 
+plot(seattle_spdf); plot(scattered.buffs.spdf, co="pink", border=NA, add=T) #Plot seattle and buffers
+plot(scattered_spdf, pch=".", co=scattered_spdf$property.name.short, add=T) #lay addys on top
+if(print_shapefiles){writeOGR(scattered.buffs.spdf, dsn=paste0(output.dir, "gis"), 
+                       layer="scattered.buffs", driver="ESRI Shapefile", overwrite_layer=T, check_exists = T) }
+buff.union = gUnaryUnion(scattered.buffs.spdf) #Runs instantly on my machine, crashes work machine :|
+plot(seattle_spdf); plot(scattered_spdf, pch=".", co="blue", add=T); 
+plot(buff.union, co="pink", add=T); plot(YT_sp, co="green", add=T)
+#Consider a helper function that maps the base seattle layers. Or move to ggplot right away.
+
+#Build areas
+areas = data.frame(place=c("YT", "SS", "Seattle"), 
+                   sq.mis=c(sqmi_area(YT_sp),sqmi_area(buff.union), sqmi_area(seattle_spdf)))
+
+### Spatially assign incidents to places (T/F) - assumes YT/SS don't overlap. Takes a bit of time.
+incidents_spdf$place=NA #Let's be explicit
+incidents_spdf$place[over(inc_pts, as(YT_sp,"SpatialPolygons"), fn = sum)==1] = "YT" 
+incidents_spdf$place[over(inc_pts, as(buff.union,"SpatialPolygons"), fn = sum)==1] = "SS" #~1min
+responses_spdf$place=NA #Let's be explicit
+responses_spdf$place[over(resp_pts, as(YT_sp,"SpatialPolygons"), fn = sum)==1] = "YT" 
+responses_spdf$place[over(resp_pts, as(buff.union,"SpatialPolygons"), fn = sum)==1] = "SS" #~1min
+
+setwd(output.dir) #Done reading. Move to output.
+###############################################################################
+# Notes
+# See below for discussion of area, projection and holes
+# http://r-sig-geo.2731867.n2.nabble.com/how-to-calculate-areas-of-shape-files-using-R-td5975749.html
+# NB: YT_sp@polygons[[1]]@area != gArea(YT_sp) 
+# ^ same as above ONLY because no holes. Be on the lookout for holes!
+###############################################################################
+
+
+###############################################################################
+#### 4A. Reshape incident results  #############################################
+# Append the totals and seattle-wide counts to a single dataset
+# Write total tables to output folder
+###############################################################################
+### Build incident results dataset 
+# A: Stratified by place and offense
+incident.place.results = incidents_spdf@data %>%
+  group_by(year, place, group) %>%
+  summarise(n=n()) %>%
+  complete(year, place, group, fill=list(n=0))%>%
+  filter(!is.na(place)) #Drop the others, will add up separately.
+# B: Stratified by place only to get totals - do this above?
+temp =  incidents_spdf@data %>%
+  group_by(year, place) %>% 
+  summarise(n=n()) %>%
+  mutate(group="Total") %>%
+  complete(year, place, fill=list(n=0, group="Total")) %>%
+  filter(!is.na(place)) #Drop the others, will add up separately.
+incident.place.results = bind_rows(incident.place.results, temp)
+
+incident.seattle.results = incidents_spdf@data %>%
+  group_by(year, group) %>%
+  summarise(n=n()) %>%
+  complete(year, group, fill=list(n=0))%>%
+  mutate(place="Seattle")
+temp =  incidents_spdf@data %>%
+  group_by(year) %>%
+  summarise(n=n()) %>%
+  mutate(group="Total", place="Seattle") %>%
+  complete(year, fill=list(n=0, group="Total")) 
+incident.seattle.results = bind_rows(incident.seattle.results, temp)
+
+###
+incident.seattle.results[incident.seattle.results$group=="Total",]
+
+incident.results = bind_rows(incident.place.results, incident.seattle.results)
+incident.results = merge(incident.results, areas)
+incident.results$rate.area= incident.results$n / incident.results$sq
+write.csv(incident.results, "incident result table.csv") #write to output before subsetting
+
+### Sort and order incidents by YT count, then subsetting
+###NOTE MAYBE DON'T SUBSET 'TIL GRAPHING
+incident.groups = incident.results %>% filter(place=="YT") %>% group_by(group) %>% summarise(n = sum(n))
+incident.groups = incident.groups[order(incident.groups$n, decreasing = T),] # reorder
+#DO LATER: incident.groups.include = incident.groups$group[incident.groups$n > 10] #require 10 total obs 
+#incident.groups.exclude = incident.groups$group[!(incident.groups$group %in% incident.groups.include)]
+#incident.results = incident.results %>% filter(group %in% incident.groups.include)
+incident.results$group.f = factor(incident.results$group, levels=incident.groups$group) #order factor
+levels(incident.results$group.f) = gsub(" ", "\n",levels(incident.results$group.f)) #\n breaks
+#levels(incident.results$group.f)[1:11] #Totals and top 10. Can also use incident.groups
+incident.results$place.f = factor(incident.results$place, levels=c("YT", "SS", "Seattle"))
+
+ggplot(incident.results[incident.results$group.f != "Total",], # Quick look - move to graphs later
+       aes(year, rate.area, color=place))+
+  geom_line()+facet_wrap(~group.f)+theme_minimal()
+###############################################################################
+# Notes
+###############################################################################
+
+
+###############################################################################
+#### 4B. Reshape 911 results  ################################################
+###############################################################################
+# A: Stratified by place and offense
+response.place.results = responses_spdf@data %>%
+  group_by(year, place, group) %>%
+  summarise(n=n()) %>%
+  complete(year, place, group, fill=list(n=0))%>%
+  filter(!is.na(place)) #Drop the others, will add up separately.
+# B: Stratified by place only to get totals - do this above?
+temp =  responses_spdf@data %>%
+  group_by(year, place) %>% 
+  summarise(n=n()) %>%
+  mutate(group="Total") %>%
+  complete(year, place, fill=list(n=0, group="Total")) %>%
+  filter(!is.na(place)) #Drop the others, will add up separately.
+response.place.results = bind_rows(response.place.results, temp)
+
+response.seattle.results = responses_spdf@data %>%
+  group_by(year, group) %>%
+  summarise(n=n()) %>%
+  complete(year, group, fill=list(n=0))%>%
+  mutate(place="Seattle")
+temp =  responses_spdf@data %>%
+  group_by(year) %>%
+  summarise(n=n()) %>%
+  mutate(group="Total", place="Seattle") %>%
+  complete(year, fill=list(n=0, group="Total")) 
+response.seattle.results = bind_rows(response.seattle.results, temp)
+
+response.results = bind_rows(response.place.results, response.seattle.results)
+response.results = merge(response.results, areas)
+response.results$rate.area= response.results$n / response.results$sq
+write.csv(response.results, "response result table.csv") #write to output before subsetting
+
+### Sort and order responses by YT count, then subsetting
+response.groups = response.results %>% filter(place=="YT") %>% group_by(group) %>% summarise(n = sum(n))
+response.groups = response.groups[order(response.groups$n, decreasing = T),] # reorder
+#response.groups.include = response.groups$group[response.groups$n > 100] #require 10 total obs 
+#response.groups.exclude = response.groups$group[!(response.groups$group %in% response.groups.include)]
+#response.results = response.results %>% filter(group %in% response.groups.include)
+response.results$group.f = factor(response.results$group, levels=response.groups$group) #order factor
+levels(response.results$group.f) = gsub(" ", "\n",levels(response.results$group.f)) #\n breaks
+response.results$place.f = factor(response.results$place, levels=c("YT", "SS", "Seattle"))
+
+# Quick look - move to graphs later
+ggplot(response.results[response.results$group.f != "Total",], 
+       aes(year, rate.area, color=place))+
+  geom_line()+facet_wrap(~group.f)+theme_minimal()
+###############################################################################
+# Notes
+###############################################################################
+
+
+###############################################################################
+##### 5. Population Raster: Use a pop raster to build crime rates ############
+# Uses previous spatial areas (drawn and buffers), with a population raster
+###############################################################################
+library(raster) #Need to load later...?
+### Build the raster
+pop.raster = raster(extent(seattle_spdf)) #Build an empty raster over our map
+e=extent(seattle_spdf); c((e@xmax-e@xmin),(e@ymax-e@ymin))/ftinmile; #(roughly 9mi wide by 16.5 tall)
+projection(pop.raster) = CRS(wa_proj) #Set projection
+raster.res = ftinmile/8 #Resolution is 1/xth of a mile
+res(pop.raster) = c(raster.res, raster.res) #Note res(r)=raster.res^2 is Not right!
+bgs_spdf$frac.pop = bgs_spdf$total / (bgs_spdf$area_sqft)*raster.res^2 
+
+pop.raster = rasterize(bgs_spdf, pop.raster, "frac.pop") # rasterize our block groups. This can be improved on.
+plot(pop.raster); #plot(bgs_spdf, border="black", add=T)
+cellStats(pop.raster, sum); sum(bgs_spdf$total)#need this to match the total pop. I'm close.
+plot(pop.raster, main="Heatmap (raster) of \ninterpolated 2010 population (count)")
+writeRaster(pop.raster, "./gis/2010pop.tif", format="GTiff", overwrite=T)
+#^ TO DO Above, if write.files
+
+### Build an incident count raster
+inc.count.raster = raster(extent(seattle_spdf))
+projection(inc.count.raster) = CRS(wa_proj); res(inc.count.raster) = c(raster.res, raster.res)
+inc.count.raster = rasterize(incidents_spdf, inc.count.raster, incidents_spdf$n, fun="count")
+#get a "per year" rate. Don't use max-min so we can drop middle years safely
+inc.count.raster = inc.count.raster / length(inc_analysis_years) #avg per year
+plot(inc.count.raster, main="Heatmap\nAvg incidents per year (count)")
+sum(incidents_spdf$n); cellStats(inc.count.raster, sum) 
+# ^ NOTE: This heat map seems to drop a big chunk. Not used in analysis, but still: Why?
+
+### Build an incident rate raster
+inc.rate.raster = inc.count.raster / pop.raster*1000
+inc.rate.raster[inc.rate.raster>=quantile(inc.rate.raster, .98)] = 
+  quantile(inc.rate.raster, .98) # Clip the outliers (crimes in ~zero population areas)
+plot(inc.rate.raster, col=topo.colors(20), main="Heatmap\nAvg incident rate per 1000 residents")
+writeRaster(inc.rate.raster, "./gis/crimerate_bypop.tif", format="GTiff", overwrite=T)
+summary(inc.rate.raster)
+
+# Build 2010 "anchor" population-based rates. Load with 2010, then adjust
+pop.table = data.frame(place=rep(c("YT", "SS", "Seattle"), length(study_years)), 
+                       year=rep(study_years, each=3), 
+                       pop=NA, stringsAsFactors = F)
+e = extract(pop.raster, buff.union)
+pop.table$pop[pop.table$place=="SS"] = round(sum(unlist(e), na.rm=T),0) #~85k in SS buffers
+e = extract(pop.raster, YT_sp)
+pop.table$pop[pop.table$place=="YT"] = round(sum(unlist(e), na.rm=T),0) #2,800 in YT
+pop.table$pop[pop.table$place=="Seattle"] = round(cellStats(pop.raster, sum),0) #622,184
+pop.table = merge(pop.table, pop.adjust.table[,c("year", "multv2010")])
+pop.table$pop = as.integer(pop.table$pop * pop.table$multv2010); pop.table = pop.table[,c("year", "place", "pop")]
+pop.table$year = pop.table$year - 2000
+
+incident.results2 = merge(incident.results, pop.table); names(incident.results2)
+incident.results2$rate.pop = incident.results2$n / incident.results2$pop *1000
+response.results2 = merge(response.results, pop.table); names(response.results2)
+response.results2$rate.pop = response.results2$n / response.results2$pop *1000
+###NOTE - would be better not to dump the data table earlier... but do HERE instead
+###############################################################################
+# NOTES
+# On rasters: 
+# http://gis.stackexchange.com/questions/201530/rasterizing-in-r-how-do-resolutions-work-e-g-population-within-a-circle
+# http://gis.stackexchange.com/questions/24588/converting-point-data-into-gridded-dataframe-for-histogram-analysis-using-r
+# ... and colors: http://gis.stackexchange.com/questions/140734/legend-colour-with-specific-value
+# Note, because of package overlaps, waiting to install this 'til needed. See below.
+# https://github.com/hadley/dplyr/issues/1480
+# On extract namespace conflict: https://github.com/stan-dev/rstan/issues/118
+# unloadNamespace("raster"); detach("package:raster", unload=TRUE) are not recommended.
+###############################################################################
+
+
+###############################################################################
+# 6. Graphs ##########################################################################
+###############################################################################
+### Incidents
+# Touch up incident data for graphing: drop small #s, order levels
+head(incident.results2)
+incident.results2$place.f = factor(incident.results2$place, levels=c("YT", "SS", "Seattle"))
+# ^ Delete eventually
+incident_tograph = incident.results2 %>% 
+  filter(group %in% incident.groups$group[incident.groups$n>10*length(study_years)]) %>%
+  filter(group != "Total")
+
+# Quick looks
+ggplot(incident_tograph, aes(year, rate.pop, color=place.f))+
+  geom_line()+geom_point()+facet_wrap(~group.f)+theme_bw()+
+  scale_color_manual(values = c("blue", "brown", "black"))
+  #scale_color_brewer(type="qual")
+ggplot(incident_tograph, aes(year, rate.pop, color=place.f))+
+  geom_line()+geom_point()+facet_wrap(~group.f, scales = "free_y")+ # Free fly
+  theme_bw()+ scale_color_manual(values = c("blue", "brown", "black"))
+
+# Pretty look
+#NOTE: g+ggplot(aes(y=rate.pop)) #There's a better way... #Move to graphs
+g = ggplot(incident_tograph, aes(year, rate.pop, color=place.f))+
+  geom_line(size=1)+ geom_point(aes(shape=place.f))+
+  facet_grid(.~group.f, switch = "x")+
+  theme_tufte() + #also try minimal
+  theme(axis.title.x=element_blank(),axis.text.x=element_blank(),axis.ticks.x=element_blank())+
+  labs(title="Incident rate (/1000 people) by type, YT vs. SS, 2008-2015", 
+       subtitle="Using interpolated populations from the 2010 census",
+       y="rate: incidents / pop per year")+
+  theme(strip.text.x = element_text(size = 8, angle = 0))+
+  #scale_color_manual(values = c("blue", "brown", "black"))
+  scale_color_manual(values = c("#80cdc1", "#bababa", "#404040"))#+ ##bebada
+g
+ggsave("crime rate (per 1000 people) by type, sm multiples.png", width=14, height=4) # I should still be in "output"
+shell.exec("crime rate (per 1000 people) by type, sm multiples.png")
+
+# ...with a table
+library(gridExtra)#; install.packages("gridExtra")
+head(incident_tograph)
+incident_table = incident_tograph %>% group_by(group.f, place) %>% summarise(n=sum(n)) %>% spread(group.f, n)
+mytheme <- gridExtra::ttheme_default(
+  core = list(fg_params=list(cex = 0.6)),
+  colhead = list(fg_params=list(cex = 0.6)),
+  rowhead = list(fg_params=list(cex = 0.6)))
+grid.arrange(g, tableGrob(incident_table, rows=NULL, theme=mytheme))
+
+incident_table2 = incident.results2 %>% group_by(group, place) %>% summarise(n=sum(n)) %>% spread(group, n)
+write.table(t(incident_table2), file="clipboard", sep="\t")
+grid.arrange(tableGrob(t(incident_table2), rows=NULL, theme=mytheme))
+
+incident_table_rates = incident.results2 %>% 
+  unite(py, place, year, sep=".") %>% 
+  dplyr::select(group, py, rate.pop) %>%
+  spread(py, rate.pop)
+incident_table_rates[is.na(incident_table_rates)] = 0
+write.csv(incident_table_rates, "incident table rates - wide.csv", row.names = F)
+
+### Response
+unique(response_tograph$year)
+response_tograph = response.results2 %>%
+  filter(group != "Total") %>%
+  filter(group %in% response.groups$group[1:17])
+response_tograph$place.f = factor(response_tograph$place, levels=c("YT", "SS", "Seattle"))  
+
+ggplot(response_tograph, aes(year, rate.pop, color=place.f))+
+  geom_line()+geom_point()+facet_wrap(~group.f)+theme_bw()+
+  scale_color_manual(values = c("blue", "brown", "black"))
+#scale_color_brewer(type="qual")
+
+# Pretty look
+#g = ggplot(response.results2[response.results2$group != "Total",], aes(year, rate.pop, color=place.f))+ #If you want "everything!"
+g = ggplot(response_tograph, aes(year, rate.pop, color=place.f))+
+  geom_line(size=1)+ geom_point(aes(shape=place.f))+
+  facet_grid(.~group.f, switch = "x")+
+  theme_tufte() + #also try minimal
+  theme(axis.title.x=element_blank(),axis.text.x=element_blank(),axis.ticks.x=element_blank())+
+  labs(title="911 call rate (/1000 people) by type, YT vs. SS, 2010-2015", 
+       subtitle="Using interpolated populations from the 2010 census.",
+       y="rate: 911 calls / pop per year", 
+       caption="No 2013 data, FYI")+
+  theme(strip.text.x = element_text(size = 8, angle = 0))+
+  scale_color_manual(values = c("#80cdc1", "#bababa", "#404040"))+ ##bebada
+  scale_x_continuous(limits=c(10,15))
+g
+ggsave("911 call rate (per 1000 people) by type, sm multiples.png", width=14, height=4) # I should still be in "output"
+shell.exec("911 call rate (per 1000 people) by type, sm multiples.png")
+
+# ...with a table
+head(response_tograph)
+response_table = response_tograph %>% group_by(group.f, place) %>% summarise(n=sum(n)) %>% spread(group.f, n)
+grid.arrange(g, tableGrob(response_table, rows=NULL, theme=mytheme))
+
+response_table_rates = response.results2 %>% 
+  unite(py, place, year, sep=".") %>% 
+  dplyr::select(group, py, rate.pop) %>%
+  spread(py, rate.pop)
+response_table_rates[is.na(response_table_rates)] = 0
+write.csv(response_table_rates, "response table rates - wide.csv", row.names = F)
+
+response_table_count = response.results2 %>% 
+  unite(py, place, year, sep=".") %>% 
+  dplyr::select(group, py, n) %>%
+  spread(py, n)
+response_table_count[is.na(response_table_count)] = 0
+write.csv(response_table_count, "response table count - wide.csv", row.names = F)
+
+
+###############################################################################
+# Notes
+# TODO: Might want to programmatically show what I'm dropping, in a caption perhaps. 
+# TODO: Use better colors. Seattle as black, grey, blue for instance.
+# On tables as images: http://stackoverflow.com/questions/12318120/adding-table-within-the-plotting-region-of-a-ggplot-in-r
+###############################################################################
+
+
+###############################################################################
+### 7. Statistical playground ####################################################
+###############################################################################
+# http://stats.stackexchange.com/questions/89795/difference-in-difference-regression-using-r
+# http://www.princeton.edu/~otorres/DID101R.pdf
+#############################
+head(incident.results2)
+
+incidents_tomodel = incident.results2 %>%
+  filter(place != "Seattle") %>%
+  filter(group == "Total") ##Here's where I'll subset in a loop
+
+incidents_tomodel$redevelop = ifelse(incidents_tomodel$year>=12, 1, 0)
+ggplot(data=incidents_tomodel, aes(year, rate.pop, color=place))+
+  geom_line()+geom_point()+scale_y_continuous(limits=c(0,NA))
+incident.rate.model = glm(formula = n ~ 
+                            place.f + year + redevelop + redevelop*year+ 
+                            redevelop*year*place.f, 
+                          data=incidents_tomodel, offset = log(pop/1000),family=poisson())
+
+### Predict so I can plot
+summary(incident.rate.model)
+stack(exp(coef(incident.rate.model)))
+incidents_tomodel$predict.rate = predict(incident.rate.model, type="response")
+incidents_tomodel$predict.rate = incidents_tomodel$predict.rate / incidents_tomodel$pop * 1000
+
+
+incidents_tomodel
+### Plot incident model 
+ggplot(data=incidents_tomodel, aes(x=year, y=rate.pop, color=place.f))+
+  geom_line() + geom_point() +
+  geom_line(aes(y=predict.rate), lty=2)+
+  scale_y_continuous(limits=c(0,NA)) + 
+  theme_minimal()+
+  geom_area(data=data.frame(year=c(12, 15), y=c(150,150)), aes(year,y), color="grey", alpha=0.1)+
+  labs(title="Actual and modeled total incident rate by year", 
+       subtitle="Yesler Terrace (YT) vs. Scattered Sites (SS)",
+       caption=
+"\nThis model tested whether the trend in total incident crime rate \r
+after redevelopment began (2012) for Yesler Terrace was significantly different \r
+than the trend in incident crime in Scattered Sites. The model allowed their \r
+baseline crime rates to be different, since Yesler Terrace had and has a clearly \r
+higher overall incident crime rate and consequent statistically significant difference\r
+in intercept. Though overall change in trend after 2012 was statistically significant \r
+(starting a trend upwards in both YT and SS), there was no statistically significant \r
+diference in trend between SS and YT after 2012.\r
+The data was modeled using a poisson distributed general linear model using counts of\r
+incident crimes, offset to produce rates per 1000 population.",
+       x="year", y="incident crime rate (/1000 population)")
+# ^ Should use str_wrap/strwrap()
+
+### 911 Response
+response.results2$place.f = factor(response.results2$place, levels=c("YT", "SS", "Seattle"))  
+
+head(response.results2)
+responses_tomodel = response.results2 %>%
+  filter(place != "Seattle") %>%
+  filter(group == "Total") %>%
+  filter(year >= 10) ##Here's where I'll subset in a loop
+
+responses_tomodel$redevelop = ifelse(responses_tomodel$year>=12, 1, 0)
+ggplot(data=responses_tomodel, aes(year, rate.pop, color=place))+
+  geom_line()+geom_point()+scale_y_continuous(limits=c(0,NA))
+response.rate.model = glm(formula = n ~ place.f + year + redevelop + redevelop*year + redevelop*year*place.f, 
+                          data=responses_tomodel, offset = log(pop/1000),family=poisson())
+
+### Predict so I can plot
+summary(response.rate.model)
+model.results = stack(round(exp(coef(response.rate.model)), 1))
+model.results$sterrs = round(exp(summary(response.rate.model)$coefficients[, 2]), 2)
+model.results$CI.low = model.results$values-1.96*model.results$sterrs
+model.results$CI.high = model.results$values-1.96*model.results$sterrs
+
+write.table(stack(round(exp(coef(response.rate.model)), 1)),file = "clipboard", sep="\t")
+responses_tomodel$predict.rate = predict(response.rate.model, type="response")
+# test = predict(rate.model, se.fit=T, type="response") #Can plot SEs with a touch more work.
+#head(incident.results2$predict.rate) #NB: predict doesn't handle offsets well, so doing it myself (below)
+responses_tomodel$predict.rate = responses_tomodel$predict.rate / responses_tomodel$pop * 1000
+
+### Plot model 
+responses_tomodel
+ggplot(data=responses_tomodel, aes(x=year, y=rate.pop, color=place.f))+
+  geom_line() + geom_point() +
+  geom_line(aes(y=predict.rate), lty=2)+
+  scale_y_continuous(limits=c(0,800)) + 
+  theme_minimal()+
+  geom_area(data=data.frame(year=c(12, 15), y=c(800,800)), aes(year,y), color="grey", alpha=0.1)+
+  labs(title="Actual and modeled total 911 response rate by year", 
+       subtitle="Yesler Terrace (YT) vs. Scattered Sites (SS)")#,
+
+###############################################################################
+# Notes
+# See below for excellent intro on the new ggplot caption and subtitle functions
+# http://www.r-bloggers.com/supreme-annotations/
+# on possion predict and rates: http://stats.stackexchange.com/questions/26449/predict-glm-poisson-with-offset
+###############################################################################
+
+
+###############################################################################
+#### __Side Analysis Examples: Overdose, Othello, etc. #### 
+###############################################################################
+### Slice out overdose related SPD calls (for Aley). May always want to investigate Fire/EMS 911 responses
+
+overdoses_911responses_spdf = responses_spdf[responses_spdf$group=="CASUALTY - DRUG RELATED (OVERDOSE, OTHER)",]
+plot(seattle_spdf, main="Overdose related 911 calls"); plot(overdoses_911responses_spdf, pch=".", col="dark red", add=T)
+if(print_shapefiles){ writeOGR(overdoses_911responses_spdf, 
+                               dsn=paste0(home.dir, "/output/gis"), layer="911 responses - overdose", driver="ESRI Shapefile", 
+                               overwrite_layer=T, check_exists = T)}
+
+### Slice out Othello violence. Eventually want to move to youth violence focus
+othello_indir = "S:/WORK/Yesler Terrace - RWJ/SPD Data/Othello Project/in"
+othello_outdir = "S:/WORK/Yesler Terrace - RWJ/SPD Data/Othello Project/out"
+othello_shp = spTransform(readOGR(dsn = othello_indir, layer="othello boundary"), CRS(wa_proj))
+
+## Incidents
+# Read helper tables, build subset of spatial data, output
+inj_incidents = read.csv(paste0(othello_indir,"/injury incidents.csv"), stringsAsFactors = F)
+incidents_spdf = merge(incidents_spdf, inj_incidents) #merge injury coding. Knows to group on "group"
+othello_inci_spdf = incidents_spdf[incidents_spdf$injury>0,] #subset by type
+othello_inci_spdf = othello_inci_spdf[othello_shp,] #subset by space. Spatial R is awesome.
+writeOGR(othello_inci_spdf, dsn=othello_outdir, layer="Othello injury-related SPD incidents", 
+         driver="ESRI Shapefile", overwrite_layer = T)
+othello_inc_summary = othello_inci_spdf@data %>% group_by(year, group) %>% 
+  summarise(num = sum(n)) %>% ungroup() %>% complete(year, nesting(group), fill=list(num=0)) %>% left_join(inj_incidents)
+othello_inc_summary$injury = factor(othello_inc_summary$injury, levels=1:2, labels=c("low", "high")) #FACTOR HIGH/LOW
+
+# Order and plot
+othello_inc_order = othello_inc_summary %>% group_by(group) %>% summarise(num=sum(num)) %>% arrange(desc(num))
+othello_inc_summary$group.f = factor(othello_inc_summary$group, levels=othello_inc_order$group)
+levels(othello_inc_summary$group.f) = str_wrap(levels(othello_inc_summary$group.f), 20)
+ggplot(othello_inc_summary, aes(year, num, color=injury)) + geom_line()+geom_point()+ 
+  facet_wrap(~group.f, scales = "free_y")+theme_minimal()+
+  scale_y_continuous(limits=c(0,NA))+scale_color_manual(values=c("black", "red"))+
+  theme(strip.text=element_text(size=7))+
+  labs(title="Othello Injury-related SPD Incidents\n2008-2015", 
+       subtitle="(Sorted by total incidnets. Note that scales are 'free', so some graphs at end have very small counts.)")
+ggsave(paste0(othello_outdir,"/Othello Injury-related SPD Incidents.png"), width=14,height=12)
+shell.exec(paste0(othello_outdir,"/Othello Injury-related SPD Incidents.png"))
+othello_inc_summary = othello_inc_summary %>% dplyr::select(group, injury, year, num) %>% spread(year, num)
+othello_inc_summary[is.na(othello_inc_summary)] = 0
+write.csv(othello_inc_summary, paste0(othello_outdir,"/othello injury-related incident summary table.csv"), row.names = F)
+
+## 911 Responses
+# Read helper tables, build subset of spatial data, output
+inj_responses = read.csv(paste0(othello_indir,"/injury responses.csv"), stringsAsFactors = F)
+responses_spdf = merge(responses_spdf, inj_responses) #merge injury coding. Knows to group on "group"
+othello_resp_spdf = responses_spdf[responses_spdf$injury>0,] #subset by type
+othello_resp_spdf = othello_resp_spdf[othello_shp,] #subset by space
+othello_resp_spdf$injury = factor(othello_resp_spdf$injury)
+writeOGR(othello_resp_spdf, dsn=othello_outdir, layer="Othello injury-related SPD 911 responses", 
+         driver="ESRI Shapefile", overwrite_layer = T)
+othello_resp_summary = othello_resp_spdf@data %>% group_by(year, group) %>% 
+  summarise(num = sum(n)) %>% ungroup() %>% complete(year, nesting(group), fill=list(num=0))%>% left_join(inj_responses)
+othello_resp_summary$injury = factor(othello_resp_summary$injury, levels=1:2, labels=c("low", "high")) #FACTOR HIGH/LOW) #FACTOR HIGH/LOW
+
+#Order and plot
+othello_resp_order = othello_resp_summary %>% group_by(group) %>% summarise(num=sum(num)) %>% arrange(desc(num))
+othello_resp_summary$group.f = factor(othello_resp_summary$group, levels=othello_resp_order$group)
+levels(othello_resp_summary$group.f) = str_wrap(levels(othello_resp_summary$group.f), 20)
+ggplot(othello_resp_summary, aes(year, num, color=injury))+ geom_line()+geom_point()+ 
+  facet_wrap(~group.f, scales = "free_y")+theme_minimal()+scale_y_continuous(limits=c(0,NA))+
+  theme(strip.text=element_text(size=7))+scale_color_manual(values=c("black", "red"))+
+  labs(title="Othello Injury-related SPD 911 Responses\n2010-2015", 
+       subtitle="(Sorted by total 911 responses. Excludes 2013, a low data reporting year. Note that scales are 'free', so some graphs at end have very small counts.)")
+ggsave(paste0(othello_outdir,"/Othello Injury-related 911 SPD Responses.png"), width=14,height=12)
+shell.exec(paste0(othello_outdir,"/Othello Injury-related 911 SPD Responses.png"))
+othello_resp_summary = othello_resp_summary %>% dplyr::select(group, injury, year, num) %>% spread( year, num)
+othello_resp_summary[is.na(othello_resp_summary)] = 0
+write.csv(othello_resp_summary, paste0(othello_outdir, "/othello injury-related SPD 911 responses summary table.csv"), row.names = F)
+#shell.exec(paste0(othello_outdir, "/othello injury-related SPD 911 responses summary table.csv"))
+
+# Build rasters
+othello_raster = raster(extent(othello_shp)) #Build an empty raster over our map
+e=extent(othello_shp); c((e@xmax-e@xmin),(e@ymax-e@ymin))/ftinmile; #(roughly 2mi wide by 1.2 tall)
+projection(othello_raster) = CRS(wa_proj) #Set projection
+raster.res = ftinmile/20 #Resolution is 1/xth of a mile
+res(othello_raster) = c(raster.res, raster.res) #Note res(r)=raster.res^2 is Not right!
+
+othello_raster_resp = rasterize(othello_resp_spdf, othello_raster, othello_resp_spdf$n, fun=sum) #
+plot(othello_raster_resp, main="Heatmap (raster) of \nOthello SPD 911 responses (count)")
+writeRaster(othello_raster_resp, paste0(othello_outdir, "/Othello SPD injury-related 911 response heatmap.tif"), format="GTiff", overwrite=T)
+othello_subset = othello_resp_spdf[othello_resp_spdf$injury==2,]
+writeRaster(rasterize(othello_subset, othello_raster, othello_subset$n, fun=sum), 
+            paste0(othello_outdir, "/Othello SPD explicit injury 911 response heatmap.tif"), format="GTiff", overwrite=T)
+
+othello_raster_inc = rasterize(othello_inci_spdf, othello_raster, othello_resp_spdf$n, fun=sum) #
+plot(othello_raster_inc, main="Heatmap (raster) of \nOthello SPD incidents (count)")
+writeRaster(othello_raster_inc, paste0(othello_outdir, "/Othello SPD injury-related incident heatmap.tif"), format="GTiff", overwrite=T)
+othello_subset = othello_inci_spdf[othello_inci_spdf$injury==2,]
+writeRaster(rasterize(othello_subset, othello_raster, othello_subset$n, fun=sum), 
+            paste0(othello_outdir, "/Othello SPD explicit injury incident heatmap.tif"), format="GTiff", overwrite=T)
+###############################################################################
+# Notes
+# Consider switching to if(writeshapefiles)
+# Consider "jittering" the points for better visuals
+# Considering using weights, or recoding the injury tables
+###############################################################################
